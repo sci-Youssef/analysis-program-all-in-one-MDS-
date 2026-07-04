@@ -157,7 +157,7 @@ class AnalysisApp(ctk.CTk):
             justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
-        self.mode_tabs = ctk.CTkTabview(sidebar, height=520)
+        self.mode_tabs = ctk.CTkTabview(sidebar, height=620)
         self.mode_tabs.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         self.mode_tabs.add("MD Trajectory")
         self.mode_tabs.add("GBSA / MMPBSA")
@@ -218,6 +218,20 @@ class AnalysisApp(ctk.CTk):
             row=8, column=0, sticky="w"
         )
 
+        ctk.CTkLabel(parent, text="RMSF options", font=ctk.CTkFont(weight="bold")).grid(
+            row=9, column=0, sticky="w", pady=(12, 4)
+        )
+        self.md_rmsf_multichain = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            parent, text="Multi-chain RMSF (per-chain alignment, avoids inter-chain wobble)",
+            variable=self.md_rmsf_multichain,
+        ).grid(row=10, column=0, sticky="w", padx=4, pady=2)
+        self.md_rmsf_subplots = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            parent, text="Use subplots (one per system) for multi-chain RMSF",
+            variable=self.md_rmsf_subplots,
+        ).grid(row=11, column=0, sticky="w", padx=24, pady=2)
+
     def _build_gbsa_panel(self, parent: Any) -> None:
         parent.grid_columnconfigure(0, weight=1)
 
@@ -252,6 +266,18 @@ class AnalysisApp(ctk.CTk):
         ctk.CTkRadioButton(
             parent, text="Individual (one plot per dataset)", variable=self.gbsa_plot_mode, value="individual"
         ).grid(row=8, column=0, sticky="w")
+
+        ctk.CTkLabel(parent, text="Component chart options", font=ctk.CTkFont(weight="bold")).grid(
+            row=9, column=0, sticky="w", pady=(12, 4)
+        )
+        self.gbsa_include_total = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(parent, text="Include ΔG_total in components chart", variable=self.gbsa_include_total).grid(
+            row=10, column=0, sticky="w", padx=4, pady=2
+        )
+        self.gbsa_show_labels = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(parent, text="Show value labels on bars", variable=self.gbsa_show_labels).grid(
+            row=11, column=0, sticky="w", padx=4, pady=2
+        )
 
     def _build_main(self) -> None:
         main = ctk.CTkFrame(self)
@@ -359,6 +385,8 @@ class AnalysisApp(ctk.CTk):
 
             plot_types = [key for key, var in self.md_checks.items() if var.get()]
             combined = self.md_plot_mode.get() == "combined"
+            rmsf_mode = "multichain" if self.md_rmsf_multichain.get() else "single"
+            rmsf_subplots = self.md_rmsf_subplots.get()
 
             self._log(f"Starting MD analysis ({len(datasets)} dataset(s), {len(plot_types)} plot type(s))...")
             results = run_md_analysis(
@@ -366,6 +394,8 @@ class AnalysisApp(ctk.CTk):
                 plot_types,
                 combined=combined,
                 rmsd_select=self.rmsd_select_var.get().strip() or "name CA",
+                rmsf_mode=rmsf_mode,
+                rmsf_subplots=rmsf_subplots,
                 progress=self._log,
             )
 
@@ -397,6 +427,8 @@ class AnalysisApp(ctk.CTk):
             plot_types = [key for key, var in self.gbsa_checks.items() if var.get()]
             combined = self.gbsa_plot_mode.get() == "combined"
             window = int(self.rolling_var.get().strip() or "10")
+            include_total = self.gbsa_include_total.get()
+            show_labels = self.gbsa_show_labels.get()
 
             self._log(f"Starting GBSA analysis ({len(datasets)} file(s), {len(plot_types)} plot type(s))...")
             results = run_gbsa_analysis(
@@ -405,6 +437,8 @@ class AnalysisApp(ctk.CTk):
                 combined=combined,
                 rolling_window=window,
                 progress=self._log,
+                include_total=include_total,
+                show_labels=show_labels,
             )
 
             def show_results() -> None:

@@ -10,6 +10,7 @@ import MDAnalysis as mda
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from MDAnalysis.analysis import align, rms
 from MDAnalysis.analysis.hydrogenbonds import HydrogenBondAnalysis
 from MDAnalysis.topology.guessers import guess_types
@@ -62,6 +63,184 @@ def _compute_rmsf(topology: str, trajectory: str, select: str = "protein and nam
     atoms = uni.select_atoms(select)
     rmsf_result = rms.RMSF(atoms).run()
     return atoms.resids.astype(float), rmsf_result.results.rmsf
+
+
+# ── Multi-chain RMSF helpers ──────────────────────────────────────────────────
+
+def _detect_chains_by_resid_reset(universe: mda.Universe):
+    """
+    Split protein CA atoms into chains by detecting resid resets
+    (e.g. ...,154,155,1,2,...). Returns a list of
+    (label, "atom_range", (start_index, end_index)) tuples, where the
+    indices are positions within the CA-only AtomGroup.
+    """
+    ca = universe.select_atoms("protein and name CA")
+    resids = ca.resids
+
+    boundaries = [0]
+    for j in range(1, len(resids)):
+        if resids[j] < resids[j - 1]:
+            boundaries.append(j)
+    boundaries.append(len(resids))
+
+    chain_groups = []
+    for idx in range(len(boundaries) - 1):
+        start, end = boundaries[idx], boundaries[idx + 1]
+        chain_groups.append((f"chain{idx + 1}", "atom_range", (start, end)))
+    return chain_groups
+
+
+def _chain_selection_string(universe: mda.Universe, kind: str, key) -> str:
+    """Build an MDAnalysis selection string for one chain's CA atoms."""
+    if kind == "atom_range":
+        ca = universe.select_atoms("protein and name CA")
+        start, end = key
+        indices = ca.indices[start:end]
+        return "index " + " ".join(map(str, indices))
+    elif kind == "segid":
+        return f"protein and segid {key} and name CA"
+    elif kind == "chainID":
+        return f"protein and chainID {key} and name CA"
+    else:
+        return "protein and name CA"
+
+
+def _compute_rmsf_multichain(
+    topology: str,
+    trajectory: str,
+    *,
+    progress: Callable[[str], None] | None = None,
+):
+    """
+    Compute RMSF per-chain (each chain aligned on itself) and return
+    concatenated residue positions, RMSF values, and chain boundary info.
+
+    Returns (combined_x, combined_y, chain_boundaries, chain_labels, n_chains).
+    """
+    log = progress or (lambda _msg: None)
+    u_probe = _prepare_universe(topology, trajectory)
+    chain_groups = _detect_chains_by_resid_reset(u_probe)
+    log(f"  Detected {len(chain_groups)} chain(s): {[c[0] for c in chain_groups]}")
+
+    combined_x: list[int] = []
+    combined_y: list[float] = []
+    chain_boundaries: list[int] = []
+    running_offset = 0
+
+    for label, kind, key in chain_groups:
+        u_chain = _prepare_universe(topology, trajectory)
+        sel_str = _chain_selection_string(u_chain, kind, key)
+
+        align.AlignTraj(u_chain, u_chain, select=sel_str, in_memory=True).run()
+        c_alphas = u_chain.select_atoms(sel_str)
+        rmsf_result = rms.RMSF(c_alphas).run()
+
+        n_res = len(c_alphas)
+        chain_boundaries.append(running_offset)
+        combined_x.extend(range(running_offset + 1, running_offset + n_res + 1))
+        combined_y.extend(rmsf_result.results.rmsf.tolist())
+        running_offset += n_res
+        log(f"    {label}: {n_res} residues, mean RMSF = {np.mean(rmsf_result.results.rmsf):.2f} Å")
+
+    chain_labels = [c[0] for c in chain_groups]
+    return np.asarray(combined_x), np.asarray(combined_y), chain_boundaries, chain_labels, len(chain_groups)
+
+
+def build_multichain_rmsf_figure(
+    datasets: list[TrajectoryDataset],
+    *,
+    progress: Callable[[str], None] | None = None,
+    use_subplots: bool = True,
+) -> go.Figure:
+    """
+    Build a multi-chain-aware RMSF figure.
+
+    If *use_subplots* is True, each system gets its own subplot with
+    per-chain boundary markers drawn within that subplot (recommended
+    when systems have different chain-length splits).
+
+    If *use_subplots* is False, all systems are overlaid on a single plot
+    with dotted vertical lines marking chain boundaries.
+    """
+    log = progress or (lambda _msg: None)
+
+    if use_subplots:
+        fig = make_subplots(
+            rows=len(datasets), cols=1,
+            shared_xaxes=False,
+            subplot_titles=[d.name for d in datasets],
+            vertical_spacing=0.12,
+        )
+    else:
+        fig = go.Figure()
+
+    for i, dataset in enumerate(datasets):
+        color = color_for_index(i)
+        log(f"Multi-chain RMSF: {dataset.name} ...")
+        cx, cy, boundaries, chain_labels, n_chains = _compute_rmsf_multichain(
+            dataset.topology, dataset.trajectory, progress=log,
+        )
+
+        if use_subplots:
+            row = i + 1
+            fig.add_trace(
+                go.Scatter(
+                    x=cx, y=cy,
+                    name=dataset.name,
+                    line=dict(color=color, width=1.8),
+                    showlegend=False,
+                    hovertemplate="Position: %{x}<br>RMSF: %{y:.2f} Å<extra></extra>",
+                ),
+                row=row, col=1,
+            )
+            y_max = float(np.max(cy)) * 1.1
+            for b in boundaries[1:]:
+                fig.add_shape(
+                    type="line",
+                    x0=b + 0.5, x1=b + 0.5,
+                    y0=0, y1=y_max,
+                    line=dict(color=color, dash="dot", width=1.5),
+                    opacity=0.6,
+                    row=row, col=1,
+                )
+            fig.update_xaxes(title_text="Residue position (chain 1 then chain 2)", row=row, col=1)
+            fig.update_yaxes(title_text="RMSF (Å)", row=row, col=1)
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=cx, y=cy,
+                    name=dataset.name,
+                    line=dict(color=color, width=1.8),
+                    hovertemplate=f"<b>{dataset.name}</b><br>Position: %{{x}}<br>RMSF: %{{y:.2f}} Å<extra></extra>",
+                )
+            )
+            for b in boundaries[1:]:
+                fig.add_shape(
+                    type="line",
+                    x0=b + 0.5, x1=b + 0.5,
+                    y0=0, y1=1,
+                    yref="paper",
+                    line=dict(color="gray", dash="dot", width=1),
+                    opacity=0.5,
+                )
+
+    if use_subplots:
+        fig.update_layout(
+            title={"text": "Per-Chain Cα RMSF (one subplot per complex)", "x": 0.5, "xanchor": "center"},
+            font_family="Arial, sans-serif",
+            font_size=16,
+            showlegend=False,
+            height=350 * len(datasets),
+        )
+    else:
+        apply_layout(
+            fig,
+            "Per-Chain Cα RMSF (unified axis)",
+            "Residue position (chain 1 then chain 2)",
+            "RMSF (Å)",
+            height=560,
+        )
+    return fig
 
 
 def _compute_rog(uni: mda.Universe, select: str = "protein") -> tuple[np.ndarray, np.ndarray]:
@@ -244,8 +423,23 @@ def run_md_analysis(
     *,
     combined: bool = True,
     rmsd_select: str = "name CA",
+    rmsf_mode: str = "single",
+    rmsf_subplots: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> list[MDAnalysisResult]:
+    """
+    Run MD analysis.
+
+    Parameters
+    ----------
+    rmsf_mode : str
+        ``"single"`` (default) — standard whole-complex RMSF.
+        ``"multichain"`` — per-chain alignment & concatenated axis, avoids
+        inter-chain wobble inflating fluctuation values.
+    rmsf_subplots : bool
+        When ``rmsf_mode="multichain"``, whether to use one subplot per
+        system (True) or overlay all on a single plot (False).
+    """
     if not datasets:
         raise ValueError("Add at least one trajectory dataset.")
     if not plot_types:
@@ -253,7 +447,22 @@ def run_md_analysis(
 
     results: list[MDAnalysisResult] = []
 
-    for plot_type in plot_types:
+    # ── Handle multi-chain RMSF separately ────────────────────────────────
+    plot_types_without_rmsf = [pt for pt in plot_types if pt != "rmsf"]
+    if "rmsf" in plot_types and rmsf_mode == "multichain":
+        rmsf_fig = build_multichain_rmsf_figure(
+            datasets, progress=progress, use_subplots=rmsf_subplots,
+        )
+        results.append(
+            MDAnalysisResult(
+                label="Combined — Per-Chain RMSF (multi-chain)",
+                plot_type="rmsf",
+                figure=rmsf_fig,
+                summary="Multi‑chain RMSF: per-chain alignment, concatenated residue axis.",
+            )
+        )
+
+    for plot_type in plot_types_without_rmsf:
         if combined:
             fig, summaries = _combined_figure(
                 plot_type,

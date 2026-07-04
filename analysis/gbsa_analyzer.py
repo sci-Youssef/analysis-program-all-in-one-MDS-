@@ -47,6 +47,9 @@ SECTION_HEADERS = (
 COMPONENTS = ["VDWAALS", "EEL", "EGB", "ESURF", "GGAS", "GSOLV"]
 COMP_LABELS = ["ΔVdW", "ΔEEL", "ΔEGB", "ΔESURF", "ΔGGAS", "ΔGSOLV"]
 
+COMPONENTS_EXTENDED = ["VDWAALS", "EEL", "EGB", "ESURF", "GGAS", "GSOLV", "TOTAL"]
+COMP_LABELS_EXTENDED = ["ΔVdW", "ΔEEL", "ΔEGB", "ΔESURF", "ΔGGAS", "ΔGSOLV", "ΔG_total"]
+
 
 def parse_gbsa(filepath: str) -> dict[str, pd.DataFrame]:
     sections: dict[str, pd.DataFrame] = {}
@@ -159,23 +162,38 @@ def build_timeseries_figure(datasets: list[tuple[str, dict]], *, window: int = 1
     return fig
 
 
-def build_components_figure(datasets: list[tuple[str, dict]], *, grouped: bool = True) -> go.Figure:
+def build_components_figure(
+    datasets: list[tuple[str, dict]],
+    *,
+    grouped: bool = True,
+    include_total: bool = False,
+    show_labels: bool = False,
+) -> go.Figure:
     fig = go.Figure()
+    components = COMPONENTS_EXTENDED if include_total else COMPONENTS
+    comp_labels = COMP_LABELS_EXTENDED if include_total else COMP_LABELS
     for index, (label, stats) in enumerate(datasets):
         color = color_for_index(index)
         delta = stats["delta"]
-        means = [delta[c].mean() for c in COMPONENTS]
-        stds = [delta[c].std() for c in COMPONENTS]
-        fig.add_trace(
-            go.Bar(
-                x=COMP_LABELS,
-                y=means,
-                error_y=dict(type="data", array=stds, visible=True, color="#333333", thickness=1.5, width=5),
-                marker=dict(color=color, opacity=0.85, line=dict(color="#333333", width=1.2)),
-                name=label,
-                hovertemplate=f"<b>{label}</b><br>%{{x}}<br>Mean: %{{y:.2f}} kcal/mol<extra></extra>",
-            )
+        means = [delta[c].mean() for c in components]
+        stds = [delta[c].std() for c in components]
+        bar_kwargs: dict = dict(
+            x=comp_labels,
+            y=means,
+            error_y=dict(type="data", array=stds, visible=True, color="#333333", thickness=1.5, width=5),
+            marker=dict(color=color, opacity=0.85, line=dict(color="#333333", width=1.2)),
+            name=label,
+            hovertemplate=f"<b>{label}</b><br>%{{x}}<br>Mean: %{{y:.2f}} kcal/mol<extra></extra>",
         )
+        if show_labels:
+            bar_kwargs.update(
+                text=means,
+                texttemplate="%{text:.2f}",
+                textposition="outside",
+                textfont=dict(color=color, size=12),
+                cliponaxis=False,
+            )
+        fig.add_trace(go.Bar(**bar_kwargs))
 
     fig.add_hline(y=0, line=dict(color="#333333", width=1.2))
     apply_layout(
@@ -303,10 +321,20 @@ def build_vdw_vs_eel_figure(datasets: list[tuple[str, dict]]) -> go.Figure:
     return fig
 
 
-def _single_dataset_figure(plot_type: str, label: str, stats: dict, *, window: int = 10) -> go.Figure:
+def _single_dataset_figure(
+    plot_type: str,
+    label: str,
+    stats: dict,
+    *,
+    window: int = 10,
+    include_total: bool = False,
+    show_labels: bool = False,
+) -> go.Figure:
     builders = {
         "timeseries": lambda: build_timeseries_figure([(label, stats)], window=window),
-        "components": lambda: build_components_figure([(label, stats)], grouped=False),
+        "components": lambda: build_components_figure(
+            [(label, stats)], grouped=False, include_total=include_total, show_labels=show_labels
+        ),
         "convergence": lambda: build_convergence_figure([(label, stats)]),
         "distribution": lambda: build_distribution_figure([(label, stats)]),
         "vdw_vs_eel": lambda: build_vdw_vs_eel_figure([(label, stats)]),
@@ -328,6 +356,8 @@ def run_gbsa_analysis(
     combined: bool = True,
     rolling_window: int = 10,
     progress: Callable[[str], None] | None = None,
+    include_total: bool = False,
+    show_labels: bool = False,
 ) -> list[GBSAAnalysisResult]:
     if not datasets:
         raise ValueError("Add at least one GBSA CSV file.")
@@ -347,9 +377,14 @@ def run_gbsa_analysis(
     summary_text = "\n".join(summaries)
     results: list[GBSAAnalysisResult] = []
 
+    def _build_components(data):
+        return build_components_figure(
+            data, grouped=len(data) > 1, include_total=include_total, show_labels=show_labels
+        )
+
     builders = {
         "timeseries": lambda data: build_timeseries_figure(data, window=rolling_window),
-        "components": lambda data: build_components_figure(data, grouped=len(data) > 1),
+        "components": _build_components,
         "convergence": build_convergence_figure,
         "distribution": build_distribution_figure,
         "vdw_vs_eel": build_vdw_vs_eel_figure,
@@ -368,7 +403,12 @@ def run_gbsa_analysis(
             )
         else:
             for label, stats in parsed:
-                fig = _single_dataset_figure(plot_type, label, stats, window=rolling_window)
+                fig = _single_dataset_figure(
+                    plot_type, label, stats,
+                    window=rolling_window,
+                    include_total=include_total,
+                    show_labels=show_labels,
+                )
                 results.append(
                     GBSAAnalysisResult(
                         label=f"{label} — {GBSA_PLOT_TYPES[plot_type]}",
