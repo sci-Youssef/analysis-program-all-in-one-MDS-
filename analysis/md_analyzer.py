@@ -220,7 +220,7 @@ def build_multichain_rmsf_figure(
                     x0=b + 0.5, x1=b + 0.5,
                     y0=0, y1=1,
                     yref="paper",
-                    line=dict(color="gray", dash="dot", width=1),
+                    line=dict(color="color", dash="dot", width=1),
                     opacity=0.5,
                 )
 
